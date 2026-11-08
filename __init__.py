@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import pathlib
+import posixpath
 import re
 import shlex
 import sqlite3
@@ -150,19 +151,34 @@ def _lookup_precedent(command):
     return (row[0], row[1], hashes)
 
 
-def _content_unchanged(command, stored_hashes):
+def _content_unchanged(command, stored_hashes, task_id=""):
     """True when every script file the command runs still hashes to the value
     recorded at decision time. Any difference, missing file, or read failure
-    returns False — the precedent is void and the command gets re-reviewed."""
+    returns False — the precedent is void and the command gets re-reviewed.
+    Reads resolve the same way the original review did (session cwd aware,
+    v0.2.8) so the hash check can't disagree with the original read."""
     if not isinstance(stored_hashes, dict) or not stored_hashes:
         return True
     current = {}
     for sp in _extract_script_paths(command):
-        text, _src = _read_script(sp)
+        text, _src = _read_script(sp, task_id=task_id, command=command)
         if text is None:
             return False
         current[sp] = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
     return current == stored_hashes
+
+
+def _model_rule_key(command, script_hashes):
+    """Stable allowlist grain for model-layer escalations (v0.2.8): identical
+    command + identical script bytes -> identical rule_key, so an operator
+    'Always' answer is verifiable after the fact (post_tool_call checks the
+    permanent allowlist) and Hermes's own session allowlist can honor
+    session-scoped answers. Content hashes are included so a changed script
+    gets a different key and re-prompts."""
+    h = _norm_command(command)
+    if script_hashes:
+        h += "|" + json.dumps(script_hashes, sort_keys=True)
+    return "command-reviewer:model:" + hashlib.sha256(h.encode("utf-8")).hexdigest()[:16]
 
 
 def _similar_precedents(command, min_score=0.6, limit=3):
@@ -434,28 +450,174 @@ def _read_script_via_docker_exec(path, profile=""):
 _docker_discovery_override = None
 
 
-def _read_script(path, profile=""):
+def _session_host_cwd(task_id="", command=""):
+    """Best-effort host working directory for resolving relative script paths
+    on local/ssh backends. Order of preference: the session's recorded cwd
+    (v0.23 tools.terminal_tool.get_session_cwd — updated after every completed
+    command), adjusted by plain leading `cd` segments of THIS command (they run
+    before the script invocation but after the cwd was recorded); falling back
+    to the gateway process's cwd — the v0.2.7 behavior — when nothing better is
+    known. Only leading `cd` segments are honored: a `cd` later in the command
+    cannot be attributed to a specific invocation without a real shell parser."""
+    base = None
+    try:
+        from tools.terminal_tool import get_session_cwd
+        base = get_session_cwd(task_id or None)
+    except Exception:
+        base = None
+    if not isinstance(base, str) or not base.strip():
+        base = os.getcwd()
+    try:
+        for seg in re.split(r";|\|\||&&|\n", command or ""):
+            seg = seg.strip()
+            if not seg:
+                continue
+            m = re.match(r"^cd\s+(.+)$", seg)
+            if not m:
+                break
+            d = m.group(1).strip().strip("\"'")
+            if d in ("-", "--"):
+                break  # cd - / cd -- : unknown target, stop adjusting
+            if d == "":
+                d = "~"  # bare `cd` means home
+            if d.startswith("$HOME"):
+                d = os.path.expanduser("~") + d[5:]
+            elif d.startswith("~"):
+                d = os.path.expanduser(d)
+            base = d if os.path.isabs(d) else os.path.join(base, d)
+    except Exception:
+        pass
+    return base
+
+
+def _resolve_host_path(path, task_id="", command=""):
+    """Expand ~/$HOME and resolve a relative script path against the session's
+    working directory. Without this, the host-open read tier on local/ssh
+    backends resolves relative paths against the GATEWAY process's cwd and
+    never expands ~, hard-blocking `python3 run.py` and `python3 ~/x.py`
+    (observed: ~85 false blocks/day on a non-docker install)."""
+    try:
+        p = str(path).strip().strip("\"'")
+        if not p:
+            return path
+        if p.startswith("~"):
+            p = os.path.expanduser(p)
+        elif p.startswith("$HOME"):
+            p = os.path.expanduser("~") + p[5:]
+        if p and not os.path.isabs(p):
+            p = os.path.join(_session_host_cwd(task_id, command), p)
+        return p
+    except Exception:
+        return path
+
+
+_ENV_HOME_CACHE = {}
+
+
+def _env_home():
+    """$HOME of the single active container environment, cached per env object.
+    Needed because tilde paths mean the CONTAINER's home on docker backends,
+    and the env's cat does not shell-expand ~. Single-env rule as elsewhere:
+    0 or >1 active docker envs -> None (fail towards more candidates, though:
+    this only ADDS a read candidate, it never decides alone)."""
+    try:
+        from tools import terminal_tool
+        envs = [e for e in getattr(terminal_tool, "_active_environments", {}).values()
+                if getattr(e, "env_type", "") == "docker"]
+        if len(envs) != 1:
+            return None
+        env = envs[0]
+        if env in _ENV_HOME_CACHE:
+            return _ENV_HOME_CACHE[env]
+        out = env.execute("echo $HOME")
+        home = (out.get("output") or "").strip() if isinstance(out, dict) else ""
+        if home.startswith("/"):
+            _ENV_HOME_CACHE[env] = home
+            return home
+    except Exception:
+        pass
+    return None
+
+
+def _tilde_env_path(path):
+    """Container-home candidate for a ~/ or $HOME-prefixed script path, or
+    None when the path isn't tilde-shaped or the env home is unknown."""
+    try:
+        p = str(path).strip().strip("\"'")
+        if not (p.startswith("~") or p.startswith("$HOME")):
+            return None
+        home = _env_home()
+        if not home:
+            return None
+        if p.startswith("~"):
+            rest = p[1:].lstrip("/")
+        else:
+            rest = p[5:].lstrip("/")
+        return posixpath.join(home, rest) if rest else home
+    except Exception:
+        return None
+
+
+def _cwd_joined_path(path, task_id="", command=""):
+    """Second candidate path for relative / ~ script paths: the path joined
+    against the session's recorded working directory (v0.2.8). On docker
+    backends the recorded cwd is a CONTAINER path, so this candidate is what
+    makes tiers 1-2 (container reads) able to resolve `python3 run.py`; the
+    host tier resolves separately via _resolve_host_path. None when the path
+    is absolute and needs no joining."""
+    try:
+        p = str(path).strip().strip("\"'")
+        if not p or os.path.isabs(p):
+            return None
+        if p.startswith("~"):
+            p = p[1:].lstrip("/")
+        elif p.startswith("$HOME"):
+            p = p[5:].lstrip("/")
+        if not p:
+            return None
+        base = _session_host_cwd(task_id, command)
+        return posixpath.join(base, p)
+    except Exception:
+        return None
+
+
+def _read_script(path, profile="", task_id="", command=""):
     """Read a script file for review, most-reliable source first:
     1. the session's active in-process docker environment,
     2. docker exec into the running sandbox container (label-discovered),
-    3. host-side open() for host-visible paths.
+    3. host-side open() for host-visible paths — with ~ and relative paths
+       resolved against the SESSION's cwd (v0.2.8), not the gateway's.
+    Relative/~ paths get TWO candidates each: the literal path (a shell would
+    resolve it against the interpreter's cwd) and the path joined against the
+    session's recorded cwd — the command's own `cd` segments are honored.
     Returns (text_or_None, source)."""
-    text, source = _read_script_via_env(path)
-    if text is not None:
-        return text, source
-    if _docker_discovery_override is not None:
-        text, source = _docker_discovery_override(path, profile)
+    candidates = [path]
+    tilde_env = _tilde_env_path(path)
+    if tilde_env and tilde_env not in candidates:
+        candidates.append(tilde_env)
+    alt = _cwd_joined_path(path, task_id=task_id, command=command)
+    if alt and alt not in candidates:
+        candidates.append(alt)
+    text, source = None, "unreadable"
+    for p in candidates:
+        text, source = _read_script_via_env(p)
         if text is not None:
             return text, source
-    else:
-        text, source = _read_script_via_docker_exec(path, profile)
+    for p in candidates:
+        if _docker_discovery_override is not None:
+            text, source = _docker_discovery_override(p, profile)
+        else:
+            text, source = _read_script_via_docker_exec(p, profile)
         if text is not None:
             return text, source
-    try:
-        with open(path, "r", errors="replace") as f:
-            return f.read(), "host-open"
-    except Exception:
-        return None, source
+    for p in candidates:
+        try:
+            with open(_resolve_host_path(p, task_id=task_id, command=command),
+                      "r", errors="replace") as f:
+                return f.read(), "host-open"
+        except Exception:
+            continue
+    return None, source
 
 
 _REVIEW_INSTRUCTIONS = (
@@ -544,8 +706,11 @@ def register(ctx):
         try:
             if str(surface).strip().lower() == "smart":
                 return
+            choice = str(choice).strip().lower()
+            if choice == "once":
+                return  # v0.2.8 policy: "once" creates no precedent
             if isinstance(command, str) and command.strip():
-                _record_decision(command, str(choice), str(description or ""))
+                _record_decision(command, choice, str(description or ""))
         except Exception:
             pass  # precedent recording must never disturb the pipeline
 
@@ -565,7 +730,7 @@ def register(ctx):
         register._pending_escalations = _PENDING
     pending_lock = threading.Lock()
 
-    def _stash_escalation(tool_call_id, command, content_hashes=None):
+    def _stash_escalation(tool_call_id, command, content_hashes=None, rule_key=""):
         try:
             if not tool_call_id:
                 return
@@ -575,6 +740,7 @@ def register(ctx):
                         _PENDING.pop(k, None)
                 _PENDING[str(tool_call_id)] = {
                     "command": command, "content_hashes": content_hashes or None,
+                    "rule_key": rule_key or "",
                     "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         except Exception:
             pass
@@ -582,6 +748,12 @@ def register(ctx):
     _DENY_MARKERS = ("denied by user", "not consented", "you denied this command",
                      "denied by the user", "user declined")
     _NODECISION_MARKERS = ("timed out", "was withdrawn", "cancelled")
+    # Results proving the command NEVER RAN (Hermes core guards, the plugin's
+    # own blocks, approval-gate blocks): recording those as "approved" created
+    # precedents for commands that never executed (v0.2.8 fix). No human
+    # decision happened, so they record as no-decision, which the precedent
+    # lookup never matches (it only reads approved/denied rows).
+    _BLOCKED_MARKERS = ("BLOCKED:", "could not be read for review")
 
     def on_post_tool_call(result=None, status=None, tool_call_id=None, **kwargs):
         try:
@@ -595,12 +767,34 @@ def register(ctx):
             if any(m in low for m in _DENY_MARKERS):
                 _record_decision(pending["command"], "deny", "denied after escalation",
                                  pending.get("content_hashes"))
-            elif any(m in low for m in _NODECISION_MARKERS) or status == "cancelled":
-                _record_decision(pending["command"], "timeout", "no decision")
+            elif (any(m in (text or "") for m in _BLOCKED_MARKERS)
+                  or status == "blocked"
+                  or any(m in low for m in _NODECISION_MARKERS)
+                  or status == "cancelled"):
+                _record_decision(pending["command"], "timeout",
+                                 "command was blocked before execution — no human decision")
             else:
-                # executed (ok, or failed on its own merits after consent)
-                _record_decision(pending["command"], "once", "approved after escalation",
-                                 pending.get("content_hashes"))
+                # The command ran — but WHICH approval choice did the operator
+                # make? The gateway result text doesn't say. v0.2.8 policy:
+                # only an "Always" choice creates precedent. Verify it against
+                # the permanent allowlist (approve_permanent updates the
+                # in-process set immediately, so the check is reliable right
+                # after the gate). "once" records nothing; "session" is
+                # already handled by Hermes's session allowlist for the rest
+                # of the session — the DB must not double-record it.
+                rk = pending.get("rule_key") or ""
+                permanent = False
+                if rk:
+                    try:
+                        from tools.approval import _is_permanently_approved
+                        permanent = bool(_is_permanently_approved(f"plugin_rule:{rk}"))
+                    except Exception:
+                        permanent = False
+                if permanent:
+                    _record_decision(pending["command"], "always",
+                                     "approved after escalation (operator chose always)",
+                                     pending.get("content_hashes"))
+                # once / session / unverifiable: record nothing
         except Exception:
             pass  # recording must never disturb the pipeline
 
@@ -657,7 +851,8 @@ def register(ctx):
             scan_text = command
             if tool_name == "terminal":
                 for sp in _extract_script_paths(command):
-                    text, source = _read_script(sp, profile=getattr(ctx, "profile_name", "") or "")
+                    text, source = _read_script(sp, profile=getattr(ctx, "profile_name", "") or "",
+                                                task_id=task_id, command=command)
                     if text is None:
                         script_status.append({"path": sp, "status": "unreadable"})
                     else:
@@ -716,7 +911,8 @@ def register(ctx):
                 has_scripts = bool(script_status)
                 eligible = ((not has_scripts and stored_hashes is None)
                             or (has_scripts and stored_hashes is not None
-                                and _content_unchanged(command, stored_hashes)))
+                                and _content_unchanged(command, stored_hashes,
+                                                       task_id=task_id)))
                 if eligible:
                     if decision == "approved":
                         emit("precedent", "pass", verdict="PREV_APPROVED",
@@ -742,10 +938,15 @@ def register(ctx):
                     where = " (in script contents)" if m.start() >= len(command) else ""
                     emit("static", "escalate", verdict="SUSPICIOUS", reason=why + where, rule=rid)
                     if enforce:
-                        _stash_escalation(tool_call_id, command, script_hashes)
+                        # Nonce in the rule_key: an operator "Always" on a
+                        # paranoid prompt persists a key that can never recur,
+                        # so paranoid rules keep asking every time (operator
+                        # policy: paranoid outranks precedent, never cached).
+                        rk = f"command-reviewer:{rid}:{os.urandom(4).hex()}"
+                        _stash_escalation(tool_call_id, command, script_hashes, rule_key=rk)
                         return {"action": "approve",
                                 "message": f"command-reviewer: {why}{where} — needs your approval",
-                                "rule_key": f"command-reviewer:{rid}"}
+                                "rule_key": rk}
                     return None
 
             # -- layer 5: skip-list (terminal only) ----------------------------
@@ -812,9 +1013,11 @@ def register(ctx):
                      reason=reason, model=model_name,
                      error=(getattr(result, "text", "") or "")[:200])
                 if enforce:
-                    _stash_escalation(tool_call_id, command, script_hashes)
+                    _stash_escalation(tool_call_id, command, script_hashes,
+                                      rule_key=_model_rule_key(command, script_hashes))
                     return {"action": "approve",
-                            "message": "command-reviewer: could not parse reviewer verdict — needs your approval"}
+                            "message": "command-reviewer: could not parse reviewer verdict — needs your approval",
+                            "rule_key": _model_rule_key(command, script_hashes)}
                 return None
 
             if verdict == "MALICIOUS":
@@ -826,9 +1029,11 @@ def register(ctx):
             if verdict == "SUSPICIOUS":
                 emit("model", "escalate", verdict=verdict, reason=reason, model=model_name)
                 if enforce:
-                    _stash_escalation(tool_call_id, command, script_hashes)
+                    _stash_escalation(tool_call_id, command, script_hashes,
+                                      rule_key=_model_rule_key(command, script_hashes))
                     return {"action": "approve",
-                            "message": f"command-reviewer: model verdict SUSPICIOUS — {reason}"}
+                            "message": f"command-reviewer: model verdict SUSPICIOUS — {reason}",
+                            "rule_key": _model_rule_key(command, script_hashes)}
                 return None
             if verdict == "SAFE":
                 emit("model", "pass", verdict=verdict, reason=reason, model=model_name)
@@ -839,16 +1044,21 @@ def register(ctx):
                  reason=reason, model=model_name,
                  error=(getattr(result, "text", "") or "")[:200])
             if enforce:
+                _stash_escalation(tool_call_id, command, script_hashes,
+                                  rule_key=_model_rule_key(command, script_hashes))
                 return {"action": "approve",
-                        "message": "command-reviewer: could not parse reviewer verdict — needs your approval"}
+                        "message": "command-reviewer: could not parse reviewer verdict — needs your approval",
+                        "rule_key": _model_rule_key(command, script_hashes)}
             return None
 
         except Exception as exc:  # model timeout, task missing, network, ...
             emit("error", "escalate", error=f"{type(exc).__name__}: {exc}")
             if enforce:
-                _stash_escalation(tool_call_id, command, script_hashes)
+                _stash_escalation(tool_call_id, command, script_hashes,
+                                  rule_key=_model_rule_key(command, script_hashes))
                 return {"action": "approve",
-                        "message": f"command-reviewer: reviewer unavailable ({type(exc).__name__}) — needs your approval"}
+                        "message": f"command-reviewer: reviewer unavailable ({type(exc).__name__}) — needs your approval",
+                        "rule_key": _model_rule_key(command, script_hashes)}
             return None
 
     ctx.register_hook("pre_tool_call", pre_tool_call)
