@@ -1,5 +1,5 @@
 name: command-reviewer
-version: 0.2.7
+version: 0.2.8
 description: Reviews every terminal/execute_code call before execution; blocks or escalates malicious code
 author: Sriram Subramaniam
 provides_hooks:
