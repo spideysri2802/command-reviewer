@@ -72,6 +72,25 @@ def _resolve_data_dir():
         return pathlib.Path(base) / "plugin-data" / "command-reviewer"
 
 
+def _config_allowlist_grants(rule_key):
+    """True when Hermes has persisted an 'Always' grant for this escalation's
+    rule key in the active profile's config.yaml command_allowlist (v0.2.9:
+    replaces the private tools.approval._is_permanently_approved check).
+    Hermes writes the grant to that file synchronously when the operator
+    clicks Always, so by the time the tool result returns it is on disk.
+    Read-only plain-text scan for the exact opaque key — no YAML parsing.
+    Missing/unreadable file -> False: record nothing, re-ask next time."""
+    try:
+        if not rule_key:
+            return False
+        cfg = _resolve_data_dir().parent.parent / "config.yaml"
+        if not cfg.is_file():
+            return False
+        return f"plugin_rule:{rule_key}" in cfg.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Precedent database (v0.2): human approval decisions, keyed by normalized
 # command text. Exact-match precedent is authoritative AFTER the static
@@ -213,6 +232,8 @@ REVIEWED_TOOLS = {"terminal", "execute_code"}
 
 # Longest command text sent to the model (full text still goes to the log).
 MODEL_INPUT_LIMIT = 8000
+# Longest text the static regex rules scan (command + script sections).
+_SCAN_CAP = 16000
 # Longest command text stored per log row.
 LOG_TEXT_LIMIT = 2000
 
@@ -260,7 +281,7 @@ _PARANOID_RULES = [
      "formats a filesystem"),
     ("crontab-write", r"\bcrontab\b\s+(?:-[aehu]\b|-)",
      "edits cron jobs directly"),
-    ("fork-bomb", r":\s*\(\s*\)\s*\{.*\|.*&.*\}\s*;",
+    ("fork-bomb", r":\s*\(\s*\)\s*\{[^}{\n|&]{0,30}\|[^}{\n&]{0,30}&[^}{\n]{0,30}\}\s*;",
      "fork bomb pattern"),
     ("rm-rf-root", r"\brm\s+(?:-[a-zA-Z]+\s+)*/(?:\s|$)",
      "removes from filesystem root"),
@@ -776,20 +797,14 @@ def register(ctx):
             else:
                 # The command ran — but WHICH approval choice did the operator
                 # make? The gateway result text doesn't say. v0.2.8 policy:
-                # only an "Always" choice creates precedent. Verify it against
-                # the permanent allowlist (approve_permanent updates the
-                # in-process set immediately, so the check is reliable right
-                # after the gate). "once" records nothing; "session" is
-                # already handled by Hermes's session allowlist for the rest
-                # of the session — the DB must not double-record it.
+                # only an "Always" choice creates precedent. v0.2.9: verified
+                # against the config.yaml command_allowlist (Hermes persists
+                # the grant there synchronously on "Always") — no private core
+                # imports. "once" records nothing; "session" is already
+                # handled by Hermes's session allowlist for the rest of the
+                # session — the DB must not double-record it.
                 rk = pending.get("rule_key") or ""
-                permanent = False
-                if rk:
-                    try:
-                        from tools.approval import _is_permanently_approved
-                        permanent = bool(_is_permanently_approved(f"plugin_rule:{rk}"))
-                    except Exception:
-                        permanent = False
+                permanent = _config_allowlist_grants(rk)
                 if permanent:
                     _record_decision(pending["command"], "always",
                                      "approved after escalation (operator chose always)",
@@ -883,6 +898,11 @@ def register(ctx):
                     return None
                 if script_sections:
                     scan_text = command + "\n" + "\n".join(script_sections)
+            # Cap the regex-scan surface (v0.2.9): command text is unbounded and
+            # 12k+ of script text is possible; static rules must never run on
+            # megabyte-scale input. The audit log still records the full text.
+            if len(scan_text) > _SCAN_CAP:
+                scan_text = scan_text[:_SCAN_CAP]
 
             # -- layer 2: hard rules (command + script contents) ---------------
             # Never overridable, by any precedent or operator decision.
@@ -985,7 +1005,7 @@ def register(ctx):
                         schema_name="command.review",
                         task="command_reviewer",
                         temperature=0.0,
-                        max_tokens=300,
+                        max_tokens=800,
                         timeout=15,
                         purpose="command-reviewer.pre_tool_call",
                     )
