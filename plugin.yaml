@@ -1,5 +1,5 @@
 name: command-reviewer
-version: 0.2.9
+version: 0.2.10
 requires_hermes: ">=0.23.0"
 description: Reviews every terminal/execute_code call before execution; blocks or escalates malicious code
 author: Sriram Subramaniam

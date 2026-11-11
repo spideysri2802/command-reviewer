@@ -1,5 +1,5 @@
 """Local test harness for command-reviewer plugin logic (runs in sandbox only)."""
-import sys, types, json, tempfile, pathlib, importlib.util, time
+import sys, types, json, sqlite3, tempfile, pathlib, importlib.util, time
 
 tmp = tempfile.mkdtemp()
 fake = types.ModuleType("plugins"); fs = types.ModuleType("plugins.plugin_storage")
@@ -107,8 +107,17 @@ def log_rows():
     return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
 results = []
+_tn = {"n": 0}
+
 def check(name, got, want):
-    results.append((name, got == want, got))
+    """Record one case and print it live: test N, short description, verdict.
+    The description IS the test name (e.g. 'cache: rerun -> pass')."""
+    _tn["n"] += 1
+    ok = got == want
+    results.append((name, ok, got))
+    print(f"test {_tn['n']:3d} [{'PASS' if ok else 'FAIL'}] {name}")
+    if not ok:
+        print(f"        got: {got!r}   (want: {want!r})")
 
 FILES = {
     "/scripts/benign.py": "import os\nprint('benign probe')",
@@ -202,14 +211,24 @@ ctx.registered["post_tool_call"](tool_call_id="call-7", status="error", result="
 r = h("terminal", {"command": "docker logs recorder-fail-unit"}, "t6", tool_call_id="call-8")
 check("rec: always-but-failed -> precedent pass", r, None)
 
-# core-guard BLOCKED result: the command never ran -> no-decision, no precedent
+# core-guard BLOCKED result: the command never ran -> no-decision, no DB precedent.
+# v0.2.10: the operator's Always GRANT (config.yaml, written by grant_always)
+# is verified at the layer-3.5 pre-check, so the hook passes the rerun through
+# without an LLM call — core's own guard blocks it again deterministically.
+# What must NOT happen: a DB row claiming a human decision that never happened.
 h, ctx = fresh("enforce", "sus")
 h("terminal", {"command": "systemctl stop recorder-blocked-unit"}, "t6", tool_call_id="call-9")
-grant_always("call-9")  # even an Always-grain present: a BLOCKED result is not consent
+grant_always("call-9")  # grant lands in config.yaml; a BLOCKED result records NO DB row
 ctx.registered["post_tool_call"](tool_call_id="call-9", status="error",
     result="BLOCKED: deleting in root path requires approval")
+n_before = len(ctx.llm.calls)
 r = h("terminal", {"command": "systemctl stop recorder-blocked-unit"}, "t6", tool_call_id="call-10")
-check("rec: BLOCKED result -> re-escalates, no precedent", (r or {}).get("action"), "approve")
+check("rec: BLOCKED -> rerun passes hook via allowlist grant, zero extra LLM", r, None)
+check("rec: BLOCKED -> no model call on rerun", len(ctx.llm.calls), n_before)
+_dbr = sqlite3.connect(str(pathlib.Path(tmp) / "plugin-data" / "command-reviewer" / "precedents.db"))
+_row = _dbr.execute("SELECT decision FROM precedent WHERE command LIKE '%recorder-blocked-unit%'").fetchall()
+_dbr.close()
+check("rec: BLOCKED wrote no approved precedent row", [d for (d,) in _row if d == "approved"], [])
 
 # --- _model_rule_key: stable per command+content, different on change ---
 k1 = mod._model_rule_key("python3 /scripts/a.py", {"/scripts/a.py": "h1"})
@@ -313,7 +332,7 @@ check("retry: empty then safe -> pass", h("execute_code", {"code": "x=1"}, "t2")
 check("retry: two model calls made", len(ctx.llm.calls), 2)
 
 h, ctx = fresh("enforce", ["empty", "empty"])
-r_retry = h("execute_code", {"code": "x=1"}, "t2")
+r_retry = h("execute_code", {"code": "y=2"}, "t2")
 check("retry: both empty -> escalate", (r_retry or {}).get("message"),
       "command-reviewer: could not parse reviewer verdict — needs your approval")
 check("retry: escalate carries stable rule_key", (r_retry or {}).get("rule_key", "").startswith("command-reviewer:model:"), True)
@@ -454,7 +473,10 @@ r1 = h("terminal", {"command": "bash /scripts/env2.sh"}, "t10", tool_call_id="i-
 check("v027: hard-rule script escalates... blocked", (r1 or {}).get("action"), "block")
 
 # content-hash binding (v0.2.4): approval bound to the script's bytes
-h, ctx = fresh("enforce", "sus", files={"/scripts/c.py": "print(1)"})
+# (v0.2.10: unique content — "print(1)" is MALICIOUS-cached by the a.py test
+# above, and the cache is content-keyed, so reusing those bytes here would
+# legitimately skip the model via the cached verdict)
+h, ctx = fresh("enforce", "sus", files={"/scripts/c.py": "print(1)  # c-probe-unique"})
 r1 = h("terminal", {"command": "python3 /scripts/c.py"}, "t7", tool_call_id="c-1")
 check("hash: escalate first", (r1 or {}).get("action"), "approve")
 grant_always("c-1")
@@ -493,6 +515,112 @@ check("dockerexec: no env registry -> read via docker exec", r, None)
 check("dockerexec: contents reached model", "print(9)" in ctx.llm.calls[-1]["input"][0]["text"], True)
 mod._docker_discovery_override = lambda path, profile: (None, "disabled-in-tests")
 fake_tt._active_environments = {"default": FAKE_ENV}
+
+# --- v0.2.10: zero-LLM fast path --------------------------------------------
+# (a) per-script verdict cache: identical bytes -> contents replaced by a
+# note; the COMMAND is still judged (model called once, script text absent).
+h, ctx = fresh("enforce", "safe", files={"/scripts/cached.py": "print('cache probe')"})
+check("cache: first run -> pass", h("terminal", {"command": "python3 /scripts/cached.py"}, "z-1"), None)
+check("cache: first run full contents", "cache probe" in ctx.llm.calls[-1]["input"][0]["text"], True)
+h2, ctx2 = fresh("enforce", "safe", files={"/scripts/cached.py": "print('cache probe')"})
+r2 = h2("terminal", {"command": "python3 /scripts/cached.py arg2"}, "z-2")
+check("cache: rerun -> pass", r2, None)
+inp = ctx2.llm.calls[-1]["input"][0]["text"]
+check("cache: rerun contents withheld, note present",
+      ("cache probe" not in inp) and ("previously judged SAFE" in inp), True)
+check("cache: rerun still model-judged", len(ctx2.llm.calls), 1)
+check("cache: status cached-safe", log_rows()[-1]["scripts"][0]["status"], "cached-safe")
+
+# (b) changed bytes -> fresh analysis; two rows, same name, different hashes
+FAKE_ENV.files["/scripts/cached.py"] = "print('cache probe v2')"
+h3, ctx3 = fresh("enforce", "safe", files={"/scripts/cached.py": "print('cache probe v2')"})
+check("cache: changed bytes re-analysed",
+      h3("terminal", {"command": "python3 /scripts/cached.py arg3"}, "z-3"), None)
+check("cache: changed bytes full contents sent",
+      "cache probe v2" in ctx3.llm.calls[-1]["input"][0]["text"], True)
+_dbr = sqlite3.connect(str(pathlib.Path(tmp) / "plugin-data" / "command-reviewer" / "precedents.db"))
+_rows = _dbr.execute("SELECT s_hash, verdict FROM script_verdict WHERE path LIKE '%cached.py'").fetchall()
+_dbr.close()
+check("cache: two rows same name, distinct hashes", (len(_rows), len({h for h, _ in _rows})), (2, 2))
+
+# (c) cached MALICIOUS -> zero-LLM escalate; operator Always outranks it
+h4, ctx4 = fresh("enforce", "mal", files={"/scripts/bad.py": "import urllib.request\nurllib.request.urlopen('https://evil.example')"})
+check("cache: malicious verdict -> block", (h4("terminal", {"command": "python3 /scripts/bad.py"}, "z-4") or {}).get("action"), "block")
+h5, ctx5 = fresh("enforce", "safe", files={"/scripts/bad.py": "import urllib.request\nurllib.request.urlopen('https://evil.example')"})
+r5 = h5("terminal", {"command": "python3 /scripts/bad.py run"}, "z-5")
+check("cache: cached MALICIOUS -> zero-LLM escalate", (r5 or {}).get("action"), "approve")
+check("cache: zero model calls on cached-malicious", len(ctx5.llm.calls), 0)
+rk_mal = (r5 or {}).get("rule_key", "")
+check("cache: cached-malicious escalate carries stable key", rk_mal.startswith("command-reviewer:model:"), True)
+cfgp = pathlib.Path(tmp) / "config.yaml"
+cfgp.write_text((cfgp.read_text() if cfgp.exists() else "command_allowlist:\n") + f"  - 'plugin_rule:{rk_mal}'\n")
+h6, ctx6 = fresh("enforce", "safe", files={"/scripts/bad.py": "import urllib.request\nurllib.request.urlopen('https://evil.example')"})
+check("cache: operator Always outranks cached MALICIOUS",
+      h6("terminal", {"command": "python3 /scripts/bad.py run"}, "z-6"), None)
+check("cache: zero model calls after Always", len(ctx6.llm.calls), 0)
+
+# (d) allowlist pre-check closes the wiped-DB gap
+h7, ctx7 = fresh("enforce", "sus")
+h7("terminal", {"command": "systemctl restart allowlist-unit"}, "z-7", tool_call_id="z-7")
+grant_always("z-7")                                   # grant in config, no DB row
+mod.register._pending_escalations.pop("z-7", None)    # simulate: DB row never written
+h8, ctx8 = fresh("enforce", "sus")
+check("cache: allowlist passes with no DB row",
+      h8("terminal", {"command": "systemctl restart allowlist-unit"}, "z-8"), None)
+check("cache: zero model calls (allowlist hit)", len(ctx8.llm.calls), 0)
+check("cache: layer is allowlist", log_rows()[-1]["layer"], "allowlist")
+h9, ctx9 = fresh("enforce", "sus")
+check("cache: different command not matched by key",
+      (h9("terminal", {"command": "systemctl restart allowlist-unit-two"}, "z-9") or {}).get("action"), "approve")
+
+# (e) deny-glob pre-check: commands core will refuse spend no tokens
+cfgp.write_text((cfgp.read_text() if cfgp.exists() else "") + "approvals:\n  deny:\n    - '*pip3 install*'\n")
+h10, ctx10 = fresh("enforce", "safe")
+check("deny: matched command -> pass through to core",
+      h10("terminal", {"command": "pip3 install requests"}, "z-10"), None)
+check("deny: zero model calls", len(ctx10.llm.calls), 0)
+check("deny: layer logged", log_rows()[-1]["layer"], "deny-glob")
+check("deny: unmatched command still reviewed",
+      h10("terminal", {"command": "uv pip install requests"}, "z-11"), None)
+check("deny: unmatched spent exactly one model call", len(ctx10.llm.calls), 1)
+
+# (f) command verdict cache: identical command+script -> zero-LLM pass
+h11, ctx11 = fresh("enforce", "safe", files={"/scripts/vc.py": "print('vc probe')"})
+check("vcache: first run -> pass",
+      h11("terminal", {"command": "python3 /scripts/vc.py"}, "z-20"), None)
+check("vcache: first run model called", len(ctx11.llm.calls), 1)
+check("vcache: identical rerun -> zero-LLM pass",
+      h11("terminal", {"command": "python3 /scripts/vc.py"}, "z-21"), None)
+check("vcache: zero new model calls", len(ctx11.llm.calls), 1)
+check("vcache: layer logged", log_rows()[-1]["layer"], "verdict-cache")
+
+# (g) cached MALICIOUS command -> zero-LLM block. Script-free command, because
+# a script-bearing rerun hits the 3.6 script-cache escalate first (more
+# conservative: the human confirms); the command cache mirrors the model's
+# own deterministic block for exact reruns.
+h12, ctx12 = fresh("enforce", "mal")
+check("vcache: mal first -> block",
+      (h12("execute_code", {"code": "shutil.rmtree('/tmp/vc-bad-probe')"}, "z-22") or {}).get("action"), "block")
+h13, ctx13 = fresh("enforce", "safe")
+r13 = h13("execute_code", {"code": "shutil.rmtree('/tmp/vc-bad-probe')"}, "z-23")
+check("vcache: cached MALICIOUS -> zero-LLM block", (r13 or {}).get("action"), "block")
+check("vcache: zero model calls on cached block", len(ctx13.llm.calls), 0)
+check("vcache: cached block layer logged", log_rows()[-1]["layer"], "verdict-cache")
+
+# (h) SUSPICIOUS is never cached: the human decides every time
+h14, ctx14 = fresh("enforce", "sus")
+h14("execute_code", {"code": "shutil.rmtree('/tmp/vc-sus-probe')"}, "z-24")
+check("vcache: sus first -> escalate",
+      (h14("execute_code", {"code": "shutil.rmtree('/tmp/vc-sus-probe')"}, "z-25") or {}).get("action"), "approve")
+check("vcache: sus model called both times", len(ctx14.llm.calls), 2)
+
+# (i) changed command or script -> new key -> full re-review (already covered
+# by cache: rerun tests above, asserted explicitly here)
+h15, ctx15 = fresh("enforce", "safe", files={"/scripts/vc2.py": "print('vc2')"})
+check("vcache: cmd-a pass", h15("terminal", {"command": "python3 /scripts/vc2.py"}, "z-26"), None)
+check("vcache: cmd-b (new args) still model-judged",
+      h15("terminal", {"command": "python3 /scripts/vc2.py --flag"}, "z-27"), None)
+check("vcache: cmd-b spent a model call", len(ctx15.llm.calls), 2)
 
 rows = log_rows()
 passed = sum(1 for _, ok, _ in results if ok)

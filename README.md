@@ -7,7 +7,7 @@ this" and "it ran" checks whether the code is actually malicious.
 
 **command-reviewer closes that gap.** A plugin hook reviews every
 `terminal` and `execute_code` call before it runs: commands get checked by
-deterministic rules and an LLM reviewer, and scripts get their *contents*
+deterministic rules and an LLM reviewer, and scripts get their _contents_
 read and judged, not just their filenames. Malicious code is blocked.
 Anything uncertain goes to you for approve/deny — and your decision is
 remembered, bound to the exact bytes of the script, so you only judge a
@@ -35,6 +35,16 @@ Requires Hermes Agent v0.23+ (Docker terminal backend recommended).
 Model reviews use the `command_reviewer` auxiliary task, which follows your
 main model (one small LLM call per reviewed command). Pin a cheaper model in
 Desktop Settings → Models if you like.
+
+## Testing
+
+A standalone harness is included: `python3 test_reviewer.py` (no
+dependencies, exits nonzero on failure). It covers every decision layer —
+including the zero-LLM fast path: per-script verdict caching by content
+hash, the per-command verdict cache for identical reruns, the
+config-allowlist pre-check, and the deny-glob pass-through — plus a timing
+test proving the fork-bomb rule matches a 12KB adversarial single-line
+input in under 100ms.
 
 ## License
 

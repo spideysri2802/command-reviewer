@@ -125,6 +125,22 @@ def _db():
         ts       TEXT,
         content_hashes TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS script_verdict (
+        s_hash  TEXT PRIMARY KEY,
+        path    TEXT,
+        verdict TEXT NOT NULL,
+        reason  TEXT,
+        ts      TEXT,
+        model   TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS command_verdict (
+        v_key   TEXT PRIMARY KEY,
+        command TEXT,
+        verdict TEXT NOT NULL,
+        reason  TEXT,
+        ts      TEXT,
+        model   TEXT
+    )""")
     conn.commit()
     return conn
 
@@ -226,6 +242,159 @@ def _similar_precedents(command, min_score=0.6, limit=3):
             scored.append((score, ts, dec, cmd))
     scored.sort(reverse=True)
     return [(dec, ts, cmd) for _, _, dec, cmd in scored[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# Per-script verdict cache (v0.2.10 zero-LLM fast path): verdicts keyed by
+# content SHA-256. Only SAFE and MALICIOUS are cached (SUSPICIOUS is always
+# re-judged). A cached SAFE verdict replaces the script's full text in the
+# model prompt with a one-line note — it never approves the COMMAND itself.
+# A cached MALICIOUS verdict escalates the command with zero model calls;
+# the human still decides. Path/name is recorded for humans, never matched.
+# ---------------------------------------------------------------------------
+
+def _record_script_verdicts(hash_to_path, verdict, reason="", model=""):
+    """Upsert per-script verdicts after a full model review. Called only with
+    a parsed verdict. SUSPICIOUS is deliberately not persisted."""
+    if verdict not in ("SAFE", "MALICIOUS") or not hash_to_path:
+        return
+    try:
+        with _DB_LOCK:
+            conn = _db()
+            try:
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                for h, p in hash_to_path.items():
+                    conn.execute(
+                        "INSERT INTO script_verdict (s_hash, path, verdict, reason, ts, model) "
+                        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(s_hash) DO UPDATE SET "
+                        "path=excluded.path, verdict=excluded.verdict, "
+                        "reason=excluded.reason, ts=excluded.ts, model=excluded.model",
+                        (h, str(p or "")[:500], verdict, str(reason or "")[:300],
+                         now, str(model or "")[:100]))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass  # cache writes must never disturb the pipeline
+
+
+def _lookup_script_verdicts(hashes):
+    """{hash: (verdict_upper, ts)} for cached rows; misses simply absent."""
+    out = {}
+    if not hashes:
+        return out
+    try:
+        with _DB_LOCK:
+            conn = _db()
+            try:
+                qs = ",".join("?" * len(hashes))
+                rows = conn.execute(
+                    f"SELECT s_hash, verdict, ts FROM script_verdict WHERE s_hash IN ({qs})",
+                    [str(h) for h in hashes]).fetchall()
+            finally:
+                conn.close()
+        for h, v, ts in rows:
+            out[h] = (str(v).upper(), ts)
+        return out
+    except Exception:
+        return {}
+
+
+def _record_command_verdict(rule_key, command, verdict, reason="", model=""):
+    """Upsert the reviewer's verdict for an exact command+script combination
+    (v0.2.10 zero-LLM fast path). Only SAFE and MALICIOUS are cached —
+    SUSPICIOUS is always re-judged and always reaches the human. v_key is the
+    model rule key: identical command + identical script bytes -> identical
+    key; any change -> new key -> full re-review."""
+    if verdict not in ("SAFE", "MALICIOUS") or not rule_key:
+        return
+    try:
+        with _DB_LOCK:
+            conn = _db()
+            try:
+                conn.execute(
+                    "INSERT INTO command_verdict (v_key, command, verdict, reason, ts, model) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(v_key) DO UPDATE SET "
+                    "command=excluded.command, verdict=excluded.verdict, "
+                    "reason=excluded.reason, ts=excluded.ts, model=excluded.model",
+                    (str(rule_key), _norm_command(command)[:2000], verdict,
+                     str(reason or "")[:300],
+                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     str(model or "")[:100]))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass  # cache writes must never disturb the pipeline
+
+
+def _lookup_command_verdict(rule_key):
+    """Cached verdict for this exact command+script combination, else None."""
+    if not rule_key:
+        return None
+    try:
+        with _DB_LOCK:
+            conn = _db()
+            try:
+                row = conn.execute(
+                    "SELECT verdict FROM command_verdict WHERE v_key=?",
+                    (str(rule_key),)).fetchone()
+            finally:
+                conn.close()
+        if row and row[0] in ("SAFE", "MALICIOUS"):
+            return row[0]
+    except Exception:
+        return None
+    return None
+
+
+def _config_deny_globs():
+    """Tolerant read-only scan of approvals.deny globs in config.yaml (the same
+    file the allowlist check reads). Returns glob strings; [] when absent or
+    unparsable — callers fall through to the normal flow, never to less
+    scrutiny. Supports block-list and inline-list shapes."""
+    try:
+        cfg = _resolve_data_dir().parent.parent / "config.yaml"
+        if not cfg.is_file():
+            return []
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+        inline = re.search(r"(?m)^\s*deny:\s*\[([^\]]+)\]", text)
+        if inline:
+            return [g.strip().strip("\"'") for g in inline.group(1).split(",")
+                    if g.strip().strip("\"'")]
+        m = re.search(r"(?m)^(\s*)deny:\s*$", text)
+        if not m:
+            return []
+        base_indent = len(m.group(1))
+        globs = []
+        for line in text[m.end():].splitlines():
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent <= base_indent:
+                break
+            item = re.match(r"\s*-\s*(.+)$", line)
+            if item:
+                g = item.group(1).strip().strip("\"'")
+                if g:
+                    globs.append(g)
+        return globs
+    except Exception:
+        return []
+
+
+def _matches_deny_globs(command):
+    """The first core deny glob matching the command, else None. A glob match
+    only means core will refuse the call itself — the plugin defers and spends
+    no model tokens; it never blocks or approves on its own here."""
+    try:
+        from fnmatch import fnmatch
+        for g in _config_deny_globs():
+            if g and fnmatch(command, g):
+                return g
+    except Exception:
+        return None
+    return None
 
 # Tools this reviewer inspects. Everything else returns immediately.
 REVIEWED_TOOLS = {"terminal", "execute_code"}
@@ -661,7 +830,11 @@ _REVIEW_INSTRUCTIONS = (
     "When a 'Script contents' section is present, those are the actual file "
     "contents read at review time — judge the command as if that code is what "
     "runs. If a referenced script's contents could NOT be read, do not assume "
-    "it is safe. "
+    "it is safe. A note reading 'verdict from cache' is different: the "
+    "reviewer previously judged those exact bytes (hash shown) and the verdict "
+    "is trusted for the script's behavior — do NOT treat that as unreadable. "
+    "In every case still judge THIS command: its arguments and what it does "
+    "with the script. "
     "If an 'Operator precedent' section is present, treat it as background "
     "only: past human decisions on similar commands inform you, but the verdict "
     "must reflect what THIS command actually does. "
@@ -864,20 +1037,20 @@ def register(ctx):
             # `cat ~/.ssh/id_rsa` must hit the hard floor, not just the model.
             script_sections = []
             scan_text = command
+            malicious_cached = False
             if tool_name == "terminal":
+                read_ok = []
                 for sp in _extract_script_paths(command):
                     text, source = _read_script(sp, profile=getattr(ctx, "profile_name", "") or "",
                                                 task_id=task_id, command=command)
                     if text is None:
                         script_status.append({"path": sp, "status": "unreadable"})
                     else:
-                        cut = text[:_SCRIPT_CAP]
-                        tail = "\n...[truncated]" if len(text) > _SCRIPT_CAP else ""
-                        script_sections.append(f"== {sp} ==\n{cut}{tail}")
+                        read_ok.append((sp, text))
                         script_hashes[sp] = hashlib.sha256(
                             text.encode("utf-8", "replace")).hexdigest()
                         script_status.append({"path": sp, "status": f"read:{source}",
-                                              "chars": len(cut)})
+                                              "chars": len(text[:_SCRIPT_CAP])})
                 if any(s["status"] == "unreadable" for s in script_status):
                     bad = next(s["path"] for s in script_status
                                if s["status"] == "unreadable")
@@ -896,6 +1069,38 @@ def register(ctx):
                                             "should exist, retry the command; if this "
                                             "persists, run it manually or ask your operator.")}
                     return None
+                # v0.2.10 zero-LLM fast path: a cached verdict for identical bytes
+                # replaces the script's full text in the prompt with a note. The
+                # command itself is still judged; new/changed bytes are always
+                # included in full.
+                cached = _lookup_script_verdicts(set(script_hashes.values()))
+                for sp, text in read_ok:
+                    cv = cached.get(script_hashes[sp])
+                    cut = text[:_SCRIPT_CAP]
+                    tail = "\n...[truncated]" if len(text) > _SCRIPT_CAP else ""
+                    if cv and cv[0] == "SAFE":
+                        script_sections.append(
+                            f"== {sp} ==\n[verdict from cache: these exact bytes "
+                            f"(sha256:{script_hashes[sp][:16]}) were previously judged "
+                            f"SAFE by the reviewer on {cv[1]}; contents not re-sent "
+                            f"to save tokens — judge this command's use of it]")
+                        for s in script_status:
+                            if s["path"] == sp:
+                                s["status"] = "cached-safe"
+                                s["chars"] = 0
+                    elif cv and cv[0] == "MALICIOUS":
+                        malicious_cached = True
+                        script_sections.append(
+                            f"== {sp} ==\n[verdict from cache: these exact bytes "
+                            f"(sha256:{script_hashes[sp][:16]}) were previously judged "
+                            f"MALICIOUS by the reviewer on {cv[1]}; contents not re-sent "
+                            f"to save tokens]")
+                        for s in script_status:
+                            if s["path"] == sp:
+                                s["status"] = "cached-malicious"
+                                s["chars"] = 0
+                    else:
+                        script_sections.append(f"== {sp} ==\n{cut}{tail}")
                 if script_sections:
                     scan_text = command + "\n" + "\n".join(script_sections)
             # Cap the regex-scan surface (v0.2.9): command text is unbounded and
@@ -915,6 +1120,17 @@ def register(ctx):
                         return {"action": "block",
                                 "message": f"command-reviewer: blocked by rule '{rid}' — {why}{where}"}
                     return None
+
+            # -- layer 2.5: core deny-glob pre-check (v0.2.10, token saver) ------
+            # When Hermes's own approvals.deny globs will refuse this command
+            # regardless of anything the reviewer says, spending model tokens
+            # on it is pure waste. Defer to core: pass with no review. The
+            # plugin itself never blocks or approves on this layer.
+            dg = _matches_deny_globs(command)
+            if dg:
+                emit("deny-glob", "pass",
+                     reason=f"matches core deny glob ({dg[:120]}) — deferring to core's deny (no model call)")
+                return None
 
             # -- layer 3: content-bound precedent (v0.2.7) ---------------------
             # Checked BEFORE the paranoid tier: a decision the operator made on
@@ -951,6 +1167,34 @@ def register(ctx):
                          reason="recorded decision is stale: script content changed or unreadable")
                     prec = None
 
+            # -- layer 3.5: config-allowlist pre-check (v0.2.10, zero LLM) -------
+            # The rule key is computable BEFORE any model call (hash of the
+            # command + the script hashes just taken). If the operator's
+            # "Always" grant for exactly this command+content is already in
+            # config.yaml, pass without a model call — even when the DB
+            # precedent row is missing (e.g. wiped). Identical bytes only.
+            rk_pre = _model_rule_key(command, script_hashes)
+            if _config_allowlist_grants(rk_pre):
+                emit("allowlist", "pass", verdict="PREV_APPROVED",
+                     reason="operator Always-grant verified in config.yaml command_allowlist (command + script hashes bound)")
+                return None
+
+            # -- layer 3.6: cached-MALICIOUS script (v0.2.10, zero LLM) ----------
+            # A referenced script whose identical bytes were previously judged
+            # MALICIOUS escalates without a model call. The human still
+            # decides — and their "Always" for this exact command (layer 3.5)
+            # outranks the cached verdict on every later run.
+            if malicious_cached:
+                emit("script-cache", "escalate", verdict="MALICIOUS",
+                     reason="a referenced script was previously judged MALICIOUS (cached verdict, no model call)")
+                if enforce:
+                    _stash_escalation(tool_call_id, command, script_hashes,
+                                      rule_key=rk_pre)
+                    return {"action": "approve",
+                            "message": "command-reviewer: a referenced script was previously judged MALICIOUS — needs your approval",
+                            "rule_key": rk_pre}
+                return None
+
             # -- layer 4: paranoid rules (command + script contents) -----------
             for rid, rx, why in _PARANOID:
                 m = rx.search(scan_text)
@@ -972,6 +1216,24 @@ def register(ctx):
             # -- layer 5: skip-list (terminal only) ----------------------------
             if tool_name == "terminal" and _skip_listed(command.strip()):
                 emit("skip-list", "pass")
+                return None
+
+            # -- layer 5.5: command verdict cache (v0.2.10, zero LLM) -----------
+            # The reviewer already judged this exact command + script bytes:
+            # SAFE -> pass, MALICIOUS -> block, with no model call. SUSPICIOUS
+            # is never cached, so gray zones always reach the human. Paranoid
+            # rules above already ran — a machine cache never silences them.
+            cv_cmd = _lookup_command_verdict(rk_pre)
+            if cv_cmd == "SAFE":
+                emit("verdict-cache", "pass", verdict="SAFE",
+                     reason="cached SAFE verdict for identical command + script bytes (no model call)")
+                return None
+            if cv_cmd == "MALICIOUS":
+                emit("verdict-cache", "block", verdict="MALICIOUS",
+                     reason="cached MALICIOUS verdict for identical command + script bytes (no model call)")
+                if enforce:
+                    return {"action": "block",
+                            "message": "command-reviewer: this exact command was previously judged MALICIOUS — blocked"}
                 return None
 
             # -- layer 6: model review (empty/unparseable verdicts retried once)
@@ -1039,6 +1301,16 @@ def register(ctx):
                             "message": "command-reviewer: could not parse reviewer verdict — needs your approval",
                             "rule_key": _model_rule_key(command, script_hashes)}
                 return None
+
+            # v0.2.10: persist per-script verdicts and the whole-command verdict
+            # for the fast path. SAFE and MALICIOUS are cached; SUSPICIOUS is
+            # never cached (always re-judged, always reaches the human). Cache
+            # writes never disturb the pipeline.
+            if script_hashes:
+                _record_script_verdicts(
+                    {h: p for p, h in script_hashes.items()},
+                    verdict, reason, model_name)
+            _record_command_verdict(rk_pre, command, verdict, reason, model_name)
 
             if verdict == "MALICIOUS":
                 emit("model", "block", verdict=verdict, reason=reason, model=model_name)
