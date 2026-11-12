@@ -349,29 +349,62 @@ def _lookup_command_verdict(rule_key):
 
 
 def _config_deny_globs():
-    """Tolerant read-only scan of approvals.deny globs in config.yaml (the same
-    file the allowlist check reads). Returns glob strings; [] when absent or
-    unparsable — callers fall through to the normal flow, never to less
-    scrutiny. Supports block-list and inline-list shapes."""
+    """Read approvals.deny from config.yaml — THAT section specifically
+    (v0.2.10 fix from the catalog review: the previous scan took the first
+    `deny:` key at ANY nesting, so a deny: list elsewhere in the file made the
+    reviewer skip commands Hermes would allow). YAML-parsed when pyyaml is
+    importable (it always is in the gateway — Hermes parses config.yaml with
+    it); otherwise a fallback scan anchored on the TOP-LEVEL `approvals:` key
+    only, never the first deny: at arbitrary nesting. Case handling matches
+    Hermes (the matcher lowercases both sides). Any parse failure -> [] ->
+    the deny-glob layer is skipped entirely and the normal flow runs, never
+    less scrutiny."""
     try:
         cfg = _resolve_data_dir().parent.parent / "config.yaml"
         if not cfg.is_file():
             return []
         text = cfg.read_text(encoding="utf-8", errors="replace")
-        inline = re.search(r"(?m)^\s*deny:\s*\[([^\]]+)\]", text)
-        if inline:
-            return [g.strip().strip("\"'") for g in inline.group(1).split(",")
-                    if g.strip().strip("\"'")]
-        m = re.search(r"(?m)^(\s*)deny:\s*$", text)
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+        if yaml is not None:
+            try:
+                data = yaml.safe_load(text) or {}
+            except Exception:
+                return []
+            if not isinstance(data, dict):
+                return []
+            approvals = data.get("approvals")
+            deny = approvals.get("deny") if isinstance(approvals, dict) else None
+            if isinstance(deny, list):
+                return [str(g).strip() for g in deny if str(g).strip()]
+            return []
+        # Fallback (no pyyaml): anchored on the TOP-LEVEL approvals: key.
+        m = re.search(r"(?m)^approvals:\s*$", text)
         if not m:
             return []
-        base_indent = len(m.group(1))
         globs = []
+        deny_indent = None
         for line in text[m.end():].splitlines():
             if not line.strip():
                 continue
             indent = len(line) - len(line.lstrip())
-            if indent <= base_indent:
+            stripped = line.strip()
+            if deny_indent is None:
+                if indent == 0:
+                    break  # left the approvals: section without a deny list
+                if stripped.startswith("deny:"):
+                    rest = stripped[5:].strip()
+                    if rest.startswith("[") and rest.endswith("]"):
+                        return [g.strip().strip("\"'") for g in rest[1:-1].split(",")
+                                if g.strip().strip("\"'")]
+                    if not rest:
+                        deny_indent = indent
+                    else:
+                        return []  # deny: <non-list> under approvals: -> skip layer
+                continue
+            if indent <= deny_indent:
                 break
             item = re.match(r"\s*-\s*(.+)$", line)
             if item:
@@ -384,13 +417,16 @@ def _config_deny_globs():
 
 
 def _matches_deny_globs(command):
-    """The first core deny glob matching the command, else None. A glob match
-    only means core will refuse the call itself — the plugin defers and spends
-    no model tokens; it never blocks or approves on its own here."""
+    """The first core deny glob matching the command, else None. Matching is
+    CASE-INSENSITIVE (v0.2.10 fix: Hermes applies deny globs without case
+    sensitivity, so the pre-check must agree both ways). A glob match only
+    means core will refuse the call itself — the plugin defers and spends no
+    model tokens; it never blocks or approves on its own here."""
     try:
         from fnmatch import fnmatch
+        low = command.lower()
         for g in _config_deny_globs():
-            if g and fnmatch(command, g):
+            if g and fnmatch(low, g.lower()):
                 return g
     except Exception:
         return None
@@ -1122,11 +1158,17 @@ def register(ctx):
                     return None
 
             # -- layer 2.5: core deny-glob pre-check (v0.2.10, token saver) ------
-            # When Hermes's own approvals.deny globs will refuse this command
-            # regardless of anything the reviewer says, spending model tokens
-            # on it is pure waste. Defer to core: pass with no review. The
-            # plugin itself never blocks or approves on this layer.
-            dg = _matches_deny_globs(command)
+            # When Hermes's own approvals.deny globs will refuse this TERMINAL
+            # command regardless of anything the reviewer says, spending model
+            # tokens on it is pure waste. Defer to core: pass with no review.
+            # TERMINAL ONLY (v0.2.10 fix from the catalog review):
+            # approvals.deny is a terminal-side control — execute_code never
+            # checks it, so a glob match on code text must not skip review
+            # there (under yolo / mode:off / the local CLI the code would run
+            # unreviewed — the user's own block-list must not become a way
+            # around the reviewer). The plugin itself never blocks or approves
+            # on this layer.
+            dg = _matches_deny_globs(command) if tool_name == "terminal" else None
             if dg:
                 emit("deny-glob", "pass",
                      reason=f"matches core deny glob ({dg[:120]}) — deferring to core's deny (no model call)")
@@ -1179,11 +1221,35 @@ def register(ctx):
                      reason="operator Always-grant verified in config.yaml command_allowlist (command + script hashes bound)")
                 return None
 
-            # -- layer 3.6: cached-MALICIOUS script (v0.2.10, zero LLM) ----------
+            # -- layer 3.6: command verdict cache (v0.2.10, zero LLM) -----------
+            # The reviewer already judged this exact command + script bytes:
+            # SAFE -> pass, MALICIOUS -> block, with no model call. Checked
+            # BEFORE the cached-MALICIOUS-script escalate (v0.2.10 fix from
+            # the live battery: the DB already held the answer — asking the
+            # human again on a known-bad command contradicts "cached
+            # MALICIOUS denies" and let an approved prompt run the payload).
+            # SUSPICIOUS is never cached, so gray zones always reach the
+            # human. Paranoid rules below already ran — a machine cache never
+            # silences them.
+            cv_cmd = _lookup_command_verdict(rk_pre)
+            if cv_cmd == "SAFE":
+                emit("verdict-cache", "pass", verdict="SAFE",
+                     reason="cached SAFE verdict for identical command + script bytes (no model call)")
+                return None
+            if cv_cmd == "MALICIOUS":
+                emit("verdict-cache", "block", verdict="MALICIOUS",
+                     reason="cached MALICIOUS verdict for identical command + script bytes (no model call)")
+                if enforce:
+                    return {"action": "block",
+                            "message": "command-reviewer: this exact command was previously judged MALICIOUS — blocked"}
+                return None
+
+            # -- layer 3.7: cached-MALICIOUS script (v0.2.10, zero LLM) ---------
             # A referenced script whose identical bytes were previously judged
-            # MALICIOUS escalates without a model call. The human still
-            # decides — and their "Always" for this exact command (layer 3.5)
-            # outranks the cached verdict on every later run.
+            # MALICIOUS — but THIS command has not been judged yet — escalates
+            # without a model call. The human still decides, and their
+            # "Always" for this exact command (layer 3.5) outranks the cached
+            # script verdict on every later run.
             if malicious_cached:
                 emit("script-cache", "escalate", verdict="MALICIOUS",
                      reason="a referenced script was previously judged MALICIOUS (cached verdict, no model call)")

